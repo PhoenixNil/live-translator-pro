@@ -45,7 +45,7 @@ function resolveInitialProvider(data) {
     return data.translationProvider;
   }
 
-  return data.deeplKey ? 'deepl' : 'qwen-mt-flash';
+  return data.deeplKey ? 'deepl' : 'qwen-mt-plus';
 }
 
 function save() {
@@ -60,13 +60,13 @@ function save() {
 }
 
 function updateProviderUI() {
-  const usingQwen = translationProvider.value === 'qwen-mt-flash';
+  const usingQwen = translationProvider.value === 'qwen-mt-plus';
   dashscopeSection.classList.toggle('hidden', !usingQwen);
   deeplSection.classList.toggle('hidden', usingQwen);
 }
 
 function getSelectedProviderLabel() {
-  return translationProvider.value === 'deepl' ? 'DeepL' : 'Qwen-MT-flash';
+  return translationProvider.value === 'deepl' ? 'DeepL' : 'Qwen-MT-plus';
 }
 
 function hasTranslationKey() {

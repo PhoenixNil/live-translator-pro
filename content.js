@@ -5,6 +5,7 @@
   let historyEl = null;
   let liveTranscriptEl = null;
   let manuallyHidden = false;
+  let historyEntries = [];
 
   const MAX_HISTORY = 4;
 
@@ -80,6 +81,10 @@
 
     .ltp-entry:last-child {
       opacity: 1;
+    }
+
+    .ltp-entry.provisional .ltp-trans {
+      color: #90caf9;
     }
 
     .ltp-orig {
@@ -184,7 +189,7 @@
     makeDraggable(head, box);
   }
 
-  function addHistoryEntry(original, translation) {
+  function createHistoryEntry() {
     ensureOverlay();
 
     const entry = document.createElement('div');
@@ -192,22 +197,39 @@
 
     const origDiv = document.createElement('div');
     origDiv.className = 'ltp-orig';
-    origDiv.textContent = original;
+    origDiv.textContent = '';
 
     const transDiv = document.createElement('div');
     transDiv.className = 'ltp-trans';
-    transDiv.textContent = translation;
 
     entry.append(origDiv, transDiv);
-    historyEl.appendChild(entry);
+    return { entry, origDiv, transDiv };
+  }
 
-    while (historyEl.children.length > MAX_HISTORY) {
-      historyEl.removeChild(historyEl.firstChild);
+  function addOrUpdateHistoryEntry(message) {
+    ensureOverlay();
+
+    let record = historyEntries.find((item) => item.entryId === message.entryId);
+
+    if (!record) {
+      record = { entryId: message.entryId, ...createHistoryEntry() };
+      historyEntries.push(record);
+      historyEl.appendChild(record.entry);
+
+      while (historyEntries.length > MAX_HISTORY) {
+        const oldest = historyEntries.shift();
+        oldest.entry.remove();
+      }
     }
+
+    record.origDiv.textContent = message.originalText || '';
+    record.transDiv.textContent = message.translation || '';
+    record.entry.classList.toggle('provisional', Boolean(message.provisional));
   }
 
   function resetOverlayContent() {
     ensureOverlay();
+    historyEntries = [];
     if (historyEl) historyEl.innerHTML = '';
     liveTranscriptEl.textContent = '';
     liveTranscriptEl.classList.add('interim');
@@ -271,7 +293,7 @@
     if (msg.type === 'transcript-result') {
       if (msg.translation && msg.originalText) {
         show();
-        addHistoryEntry(msg.originalText, msg.translation);
+        addOrUpdateHistoryEntry(msg);
         return;
       }
 

@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Live Translator Pro",
   "version": "1.0.0",
-  "description": "Real-time audio translation with Deepgram transcription and switchable DeepL or Qwen-MT-flash translation.",
+  "description": "Real-time audio translation with Deepgram transcription and switchable DeepL or Qwen-MT-plus translation.",
   "permissions": [
     "tabCapture",
     "offscreen",

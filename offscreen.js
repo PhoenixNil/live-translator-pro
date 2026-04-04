@@ -9,13 +9,30 @@ let keepAliveInterval = null;
 let reconnectAttempts = 0;
 const MAX_RECONNECT = 5;
 
-let translationBuffer = [];
-let translationTimer = null;
+let pendingFinalFragments = [];
+let pendingSentenceText = '';
+let pendingFlushTimer = null;
+let recentSourceContext = [];
+let revisableEntry = null;
+let nextEntryId = 1;
 let translationQueue = [];
 let translationInFlight = false;
 let activeTranslationAbortController = null;
+let activeTranslationJob = null;
+let stoppingCapture = false;
 
-const TRANSLATION_DEBOUNCE_MS = 800;
+const SOFT_FLUSH_IDLE_MS = 1200;
+const MAX_SENTENCE_CHARS = 120;
+const DEEPGRAM_ENDPOINTING_MS = 700;
+const DEEPGRAM_UTTERANCE_END_MS = 1000;
+const CONTEXT_WINDOW_SIZE = 5;
+const MAX_SENTENCE_CHARS_HARD = 180;
+const CLAUSE_BOUNDARY_RE = /[,;:\u3001\uff0c\uff1b]/;
+const SENTENCE_END_RE = /(?:[.!?]|\u3002|\uff01|\uff1f|\u2026)$/;
+const NO_SPACE_BEFORE_RE = /^(?:[\s,.;:!?%)\]}]|\u3001|\u3002|\uff0c|\uff01|\uff1f|\uff1b|\uff1a|\u2026)/;
+const NO_SPACE_AFTER_RE = /(?:[\s([{'"-]|\u201c|\u2018)$/;
+const ASCII_WORD_CHAR_RE = /[A-Za-z0-9]/;
+const CJK_CHAR_RE = /[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uac00-\ud7af]/;
 const QWEN_TARGET_LANGUAGE_MAP = {
   ZH: 'zh',
   EN: 'en',
@@ -36,11 +53,15 @@ chrome.runtime.onMessage.addListener((message) => {
 });
 
 async function startCapture(streamId, captureConfig) {
-  if (isCapturing) stopCapture();
+  if (isCapturing || stoppingCapture) {
+    await stopCapture();
+  }
 
   config = normalizeConfig(captureConfig);
   isCapturing = true;
+  stoppingCapture = false;
   reconnectAttempts = 0;
+  resetTranslationState();
 
   try {
     mediaStream = await navigator.mediaDevices.getUserMedia({
@@ -61,24 +82,17 @@ async function startCapture(streamId, captureConfig) {
   }
 }
 
-function stopCapture() {
+async function stopCapture() {
+  if (!isCapturing && !stoppingCapture && !hasPendingSentenceWork() && !translationInFlight) {
+    cleanupCaptureResources();
+    return;
+  }
+
+  stoppingCapture = true;
   isCapturing = false;
   reconnectAttempts = 0;
 
-  if (translationTimer) {
-    clearTimeout(translationTimer);
-    translationTimer = null;
-  }
-
-  translationBuffer = [];
-  translationQueue = [];
-  translationInFlight = false;
-
-  if (activeTranslationAbortController) {
-    activeTranslationAbortController.abort();
-    activeTranslationAbortController = null;
-  }
-
+  clearPendingFlushTimer();
   stopKeepAlive();
 
   if (deepgramSocket) {
@@ -94,6 +108,27 @@ function stopCapture() {
 
     deepgramSocket = null;
   }
+
+  if (isTranslationEnabled() && hasPendingSentenceWork()) {
+    flushPendingSentence({ lockEntry: true });
+    await waitForTranslationsToSettle(1000);
+  }
+
+  if (activeTranslationAbortController) {
+    activeTranslationAbortController.abort();
+    activeTranslationAbortController = null;
+  }
+
+  translationQueue = [];
+  translationInFlight = false;
+  activeTranslationJob = null;
+  resetTranslationState();
+  cleanupCaptureResources();
+  stoppingCapture = false;
+}
+
+function cleanupCaptureResources() {
+  stopKeepAlive();
 
   if (audioContext) {
     try {
@@ -126,7 +161,7 @@ function normalizeConfig(captureConfig = {}) {
   const deepgramKey = captureConfig.deepgramKey?.trim() || '';
   const dashscopeKey = captureConfig.dashscopeKey?.trim() || '';
   const deeplKey = captureConfig.deeplKey?.trim() || '';
-  const translationProvider = captureConfig.translationProvider || (deeplKey ? 'deepl' : 'qwen-mt-flash');
+  const translationProvider = captureConfig.translationProvider || (deeplKey ? 'deepl' : 'qwen-mt-plus');
 
   return {
     deepgramKey,
@@ -203,8 +238,11 @@ function connectDeepgram() {
   const params = new URLSearchParams({
     model: 'nova-3',
     punctuate: 'true',
+    smart_format: 'true',
     interim_results: 'true',
-    endpointing: '300',
+    vad_events: 'true',
+    utterance_end_ms: String(DEEPGRAM_UTTERANCE_END_MS),
+    endpointing: String(DEEPGRAM_ENDPOINTING_MS),
     encoding: 'linear16',
     sample_rate: '16000',
     channels: '1',
@@ -280,70 +318,277 @@ function stopKeepAlive() {
 }
 
 function handleDeepgramResult(data) {
+  if (data.type === 'UtteranceEnd') {
+    if (pendingSentenceText) {
+      flushPendingSentence({ lockEntry: true });
+    }
+
+    return;
+  }
+
   if (data.type !== 'Results') return;
 
   const transcript = data.channel?.alternatives?.[0]?.transcript || '';
-  if (!transcript.trim()) return;
+  const trimmedTranscript = transcript.trim();
+  const isFinal = Boolean(data.is_final);
 
-  const isFinal = data.is_final;
+  if (trimmedTranscript) {
+    chrome.runtime.sendMessage({
+      type: 'transcript-result',
+      transcript,
+      isFinal
+    }).catch(() => {});
+  }
 
-  chrome.runtime.sendMessage({
-    type: 'transcript-result',
-    transcript,
-    isFinal
-  }).catch(() => {});
+  if (!isTranslationEnabled()) return;
 
-  if (isFinal && isTranslationEnabled()) {
-    translationBuffer.push(transcript);
+  if (isFinal && trimmedTranscript) {
+    appendFinalFragment(trimmedTranscript);
+  }
 
-    if (translationTimer) clearTimeout(translationTimer);
+  if (shouldHardFlush(data, trimmedTranscript)) {
+    flushPendingSentence({ lockEntry: true });
+    return;
+  }
 
-    translationTimer = setTimeout(() => {
-      const text = translationBuffer.join(' ').trim();
-      translationBuffer = [];
+  if (pendingSentenceText.length >= MAX_SENTENCE_CHARS) {
+    splitAtClauseBoundary();
+    return;
+  }
 
-      if (text) {
-        enqueueTranslation(text);
-      }
-    }, TRANSLATION_DEBOUNCE_MS);
+  if (isFinal && trimmedTranscript && pendingSentenceText) {
+    scheduleSoftFlush();
   }
 }
 
-function enqueueTranslation(text) {
-  translationQueue.push(text);
+function appendFinalFragment(fragment) {
+  pendingFinalFragments.push(fragment);
+  pendingSentenceText = joinTranscriptFragments(pendingSentenceText, fragment);
+}
+
+function scheduleSoftFlush() {
+  clearPendingFlushTimer();
+
+  pendingFlushTimer = setTimeout(() => {
+    flushPendingSentence({ lockEntry: false });
+  }, SOFT_FLUSH_IDLE_MS);
+}
+
+function clearPendingFlushTimer() {
+  if (pendingFlushTimer) {
+    clearTimeout(pendingFlushTimer);
+    pendingFlushTimer = null;
+  }
+}
+
+function splitAtClauseBoundary() {
+  const text = pendingSentenceText;
+
+  if (text.length >= MAX_SENTENCE_CHARS_HARD) {
+    flushPendingSentence({ lockEntry: true });
+    return;
+  }
+
+  let splitIndex = -1;
+  for (let i = text.length - 1; i >= Math.floor(text.length * 0.4); i--) {
+    if (CLAUSE_BOUNDARY_RE.test(text[i])) {
+      splitIndex = i + 1;
+      break;
+    }
+  }
+
+  if (splitIndex === -1) {
+    scheduleSoftFlush();
+    return;
+  }
+
+  const firstPart = text.slice(0, splitIndex).trim();
+  const remainder = text.slice(splitIndex).trim();
+
+  pendingSentenceText = firstPart;
+  pendingFinalFragments = [];
+  flushPendingSentence({ lockEntry: true });
+
+  if (remainder) {
+    pendingSentenceText = remainder;
+    pendingFinalFragments = [remainder];
+  }
+}
+
+function flushPendingSentence({ lockEntry }) {
+  clearPendingFlushTimer();
+
+  const text = pendingSentenceText.trim();
+  if (!text || !isTranslationEnabled()) {
+    if (lockEntry) {
+      clearPendingSentence();
+      revisableEntry = null;
+    }
+
+    return;
+  }
+
+  const entryId = revisableEntry?.entryId ?? nextEntryId++;
+  const job = {
+    entryId,
+    originalText: text,
+    replaceLast: Boolean(revisableEntry),
+    provisional: !lockEntry,
+    lockEntry,
+    contextText: buildDeepLContext()
+  };
+
+  if (lockEntry) {
+    rememberLockedSourceText(text);
+    clearPendingSentence();
+    revisableEntry = null;
+  } else {
+    revisableEntry = { entryId };
+  }
+
+  enqueueTranslation(job);
+}
+
+function clearPendingSentence() {
+  pendingFinalFragments = [];
+  pendingSentenceText = '';
+}
+
+function resetTranslationState() {
+  clearPendingFlushTimer();
+  pendingFinalFragments = [];
+  pendingSentenceText = '';
+  recentSourceContext = [];
+  revisableEntry = null;
+  nextEntryId = 1;
+}
+
+function buildDeepLContext() {
+  return recentSourceContext.join('\n');
+}
+
+function rememberLockedSourceText(text) {
+  if (!text) return;
+
+  recentSourceContext.push(text);
+
+  while (recentSourceContext.length > CONTEXT_WINDOW_SIZE) {
+    recentSourceContext.shift();
+  }
+}
+
+function shouldHardFlush(data, transcript) {
+  if (!pendingSentenceText) return false;
+
+  if (data.speech_final) {
+    return true;
+  }
+
+  if (transcript && SENTENCE_END_RE.test(transcript)) {
+    return true;
+  }
+
+  return false;
+}
+
+function joinTranscriptFragments(currentText, nextFragment) {
+  const nextText = nextFragment.trim();
+
+  if (!nextText) return currentText;
+  if (!currentText) return nextText;
+  if (/\s$/.test(currentText)) return `${currentText}${nextText}`;
+  if (NO_SPACE_BEFORE_RE.test(nextText)) return `${currentText}${nextText}`;
+  if (NO_SPACE_AFTER_RE.test(currentText)) return `${currentText}${nextText}`;
+
+  const prevChar = currentText[currentText.length - 1];
+  const nextChar = nextText[0];
+
+  if (isCjkChar(prevChar) || isCjkChar(nextChar)) {
+    return `${currentText}${nextText}`;
+  }
+
+  if (ASCII_WORD_CHAR_RE.test(prevChar) && ASCII_WORD_CHAR_RE.test(nextChar)) {
+    return `${currentText} ${nextText}`;
+  }
+
+  if (SENTENCE_END_RE.test(currentText)) {
+    return `${currentText} ${nextText}`;
+  }
+
+  return `${currentText} ${nextText}`;
+}
+
+function isCjkChar(char) {
+  return CJK_CHAR_RE.test(char);
+}
+
+function hasPendingSentenceWork() {
+  return Boolean(pendingSentenceText || pendingFinalFragments.length || translationQueue.length);
+}
+
+function waitForTranslationsToSettle(timeoutMs) {
+  if (!translationInFlight && translationQueue.length === 0) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    const deadline = Date.now() + timeoutMs;
+
+    const poll = () => {
+      if ((!translationInFlight && translationQueue.length === 0) || Date.now() >= deadline) {
+        resolve();
+        return;
+      }
+
+      setTimeout(poll, 50);
+    };
+
+    poll();
+  });
+}
+
+function enqueueTranslation(job) {
+  translationQueue = translationQueue.filter((queuedJob) => queuedJob.entryId !== job.entryId);
+
+  if (activeTranslationJob?.entryId === job.entryId && activeTranslationAbortController) {
+    activeTranslationAbortController.abort();
+  }
+
+  translationQueue.push(job);
   processTranslationQueue();
 }
 
 async function processTranslationQueue() {
-  if (translationInFlight || !isCapturing || !isTranslationEnabled()) {
+  if (translationInFlight || (!isCapturing && !stoppingCapture) || !isTranslationEnabled()) {
     return;
   }
 
-  const text = translationQueue.shift();
-  if (!text) return;
+  const job = translationQueue.shift();
+  if (!job) return;
 
   const provider = getActiveTranslationProvider();
   const controller = new AbortController();
 
   translationInFlight = true;
   activeTranslationAbortController = controller;
+  activeTranslationJob = job;
 
   try {
     let translated = '';
 
     if (provider === 'deepl') {
-      translated = await translateWithDeepL(text, controller.signal);
+      translated = await translateWithDeepL(job.originalText, job.contextText, controller.signal);
     } else {
-      translated = await translateWithQwenMtFlash(text, controller.signal);
+      translated = await translateWithQwenMtFlash(job.originalText, job.contextText, controller.signal);
     }
 
     if (
       translated &&
-      isCapturing &&
+      (isCapturing || stoppingCapture) &&
       !controller.signal.aborted &&
       activeTranslationAbortController === controller
     ) {
-      sendFinalTranslation(text, translated);
+      sendFinalTranslation(job, translated);
     }
   } catch (err) {
     if (err.name !== 'AbortError') {
@@ -356,18 +601,32 @@ async function processTranslationQueue() {
     }
 
     translationInFlight = false;
+    activeTranslationJob = null;
 
-    if (isCapturing) {
+    if (isCapturing || stoppingCapture) {
       processTranslationQueue();
     }
   }
 }
 
-async function translateWithDeepL(text, signal) {
+async function translateWithDeepL(text, context, signal) {
   const apiKey = config.deeplKey;
   const baseUrl = apiKey.endsWith(':fx')
     ? 'https://api-free.deepl.com/v2/translate'
     : 'https://api.deepl.com/v2/translate';
+  const body = {
+    text: [text],
+    target_lang: config.targetLanguage || 'ZH',
+    model_type: 'prefer_quality_optimized'
+  };
+
+  if (config.sourceLanguage && config.sourceLanguage !== 'multi') {
+    body.source_lang = config.sourceLanguage.toUpperCase();
+  }
+
+  if (context) {
+    body.context = context;
+  }
 
   const resp = await fetch(baseUrl, {
     method: 'POST',
@@ -375,10 +634,7 @@ async function translateWithDeepL(text, signal) {
       Authorization: `DeepL-Auth-Key ${apiKey}`,
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify({
-      text: [text],
-      target_lang: config.targetLanguage || 'ZH'
-    }),
+    body: JSON.stringify(body),
     signal
   });
 
@@ -390,7 +646,25 @@ async function translateWithDeepL(text, signal) {
   return result.translations?.[0]?.text || '';
 }
 
-async function translateWithQwenMtFlash(text, signal) {
+async function translateWithQwenMtFlash(text, context, signal) {
+  const body = {
+    model: 'qwen-mt-plus',
+    input: {
+      messages: [{ role: 'user', content: text }]
+    },
+    parameters: {
+      result_format: 'message',
+      translation_options: {
+        source_lang: mapQwenSourceLanguage(config.sourceLanguage),
+        target_lang: mapQwenTargetLanguage(config.targetLanguage)
+      }
+    }
+  };
+
+  if (context) {
+    body.parameters.translation_options.context = context;
+  }
+
   const resp = await fetch(
     'https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation',
     {
@@ -399,19 +673,7 @@ async function translateWithQwenMtFlash(text, signal) {
         Authorization: `Bearer ${config.dashscopeKey}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({
-        model: 'qwen-mt-flash',
-        input: {
-          messages: [{ role: 'user', content: text }]
-        },
-        parameters: {
-          result_format: 'message',
-          translation_options: {
-            source_lang: mapQwenSourceLanguage(config.sourceLanguage),
-            target_lang: mapQwenTargetLanguage(config.targetLanguage)
-          }
-        }
-      }),
+      body: JSON.stringify(body),
       signal
     }
   );
@@ -425,7 +687,7 @@ async function translateWithQwenMtFlash(text, signal) {
 }
 
 function getActiveTranslationProvider() {
-  return config.translationProvider === 'deepl' ? 'deepl' : 'qwen-mt-flash';
+  return config.translationProvider === 'deepl' ? 'deepl' : 'qwen-mt-plus';
 }
 
 function isTranslationEnabled() {
@@ -442,7 +704,7 @@ function buildCaptureStatusMessage(prefix) {
     return `${prefix} Translation disabled: missing ${credential} API key.`;
   }
 
-  const label = provider === 'deepl' ? 'DeepL' : 'Qwen-MT-flash';
+  const label = provider === 'deepl' ? 'DeepL' : 'Qwen-MT-plus';
   return `${prefix} Translation provider: ${label}.`;
 }
 
@@ -525,17 +787,20 @@ function notifyTranslationError(provider, err) {
     return;
   }
 
-  sendStatus('warning', 'Qwen-MT-flash translation failed. Transcription is still running.', {
+  sendStatus('warning', 'Qwen-MT-plus translation failed. Transcription is still running.', {
     fatal: false
   });
 }
 
-function sendFinalTranslation(originalText, translation) {
+function sendFinalTranslation(job, translation) {
   chrome.runtime.sendMessage({
     type: 'transcript-result',
-    originalText,
+    originalText: job.originalText,
     translation,
-    isFinal: true
+    isFinal: true,
+    entryId: job.entryId,
+    replaceLast: job.replaceLast,
+    provisional: job.provisional
   }).catch(() => {});
 }
 

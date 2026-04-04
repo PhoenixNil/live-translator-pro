@@ -118,7 +118,7 @@ async function stopCapture() {
     } catch (_) {
       // Ignore cleanup errors.
     }
-  }, 500);
+  }, 1500);
 
   broadcastStatus('stopped', 'Capture stopped.');
   chrome.action.setBadgeText({ text: '' });

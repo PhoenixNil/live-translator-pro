@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=320, initial-scale=1">
+  <title>Live Translator Pro</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <h1>Live Translator Pro</h1>
+
+    <div class="status-bar">
+      <span class="status-dot" id="statusDot"></span>
+      <span id="statusText">Idle</span>
+    </div>
+
+    <div class="section">
+      <label for="deepgramKey">Deepgram API Key</label>
+      <input
+        type="password"
+        id="deepgramKey"
+        placeholder="Enter your Deepgram API key"
+        autocomplete="off"
+      >
+    </div>
+
+    <div class="section">
+      <label for="translationProvider">Translation Provider</label>
+      <select id="translationProvider">
+        <option value="qwen-mt-flash">Qwen-MT-flash</option>
+        <option value="deepl">DeepL</option>
+      </select>
+    </div>
+
+    <div class="section" id="dashscopeSection">
+      <label for="dashscopeKey">DashScope API Key</label>
+      <input
+        type="password"
+        id="dashscopeKey"
+        placeholder="Enter your DashScope API key"
+        autocomplete="off"
+      >
+    </div>
+
+    <div class="section" id="deeplSection">
+      <label for="deeplKey">DeepL API Key</label>
+      <input
+        type="password"
+        id="deeplKey"
+        placeholder="Enter your DeepL API key"
+        autocomplete="off"
+      >
+    </div>
+
+    <div class="section row">
+      <div class="field">
+        <label for="srcLang">Source Language</label>
+        <select id="srcLang">
+          <option value="multi" selected>Auto Detect</option>
+          <option value="en">English</option>
+          <option value="ja">Japanese</option>
+          <option value="ko">Korean</option>
+          <option value="zh">Chinese</option>
+          <option value="es">Spanish</option>
+          <option value="fr">French</option>
+          <option value="de">German</option>
+          <option value="ru">Russian</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="tgtLang">Target Language</label>
+        <select id="tgtLang">
+          <option value="ZH" selected>Chinese (Simplified)</option>
+          <option value="EN">English</option>
+          <option value="JA">Japanese</option>
+          <option value="KO">Korean</option>
+          <option value="DE">German</option>
+          <option value="FR">French</option>
+          <option value="ES">Spanish</option>
+          <option value="RU">Russian</option>
+        </select>
+      </div>
+    </div>
+
+    <button id="toggleBtn" class="btn-start">Start Translation</button>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

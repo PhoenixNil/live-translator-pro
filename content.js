@@ -5,6 +5,8 @@
   let historyEl = null;
   let liveTranscriptEl = null;
   let manuallyHidden = false;
+  let isCapturing = false;
+  let toggleBtn = null;
   let historyEntries = [];
 
   const MAX_HISTORY = 4;
@@ -131,6 +133,40 @@
     .ltp-live.interim {
       color: rgba(255, 255, 255, 0.45);
     }
+
+    .ltp-head-controls {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .ltp-toggle {
+      all: unset;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: #4caf50;
+      color: #fff;
+      font-size: 11px;
+      cursor: pointer;
+      line-height: 1;
+      transition: background 0.2s;
+    }
+
+    .ltp-toggle:hover {
+      background: #45a049;
+    }
+
+    .ltp-toggle.capturing {
+      background: #f44336;
+    }
+
+    .ltp-toggle.capturing:hover {
+      background: #e53935;
+    }
   `;
 
   function ensureOverlay() {
@@ -154,6 +190,11 @@
     label.className = 'ltp-label';
     label.textContent = 'Live Translator';
 
+    toggleBtn = document.createElement('button');
+    toggleBtn.className = 'ltp-toggle';
+    toggleBtn.textContent = '▶';
+    toggleBtn.onclick = () => toggleCapture();
+
     const closeBtn = document.createElement('button');
     closeBtn.className = 'ltp-close';
     closeBtn.textContent = 'x';
@@ -162,7 +203,11 @@
       hide();
     };
 
-    head.append(label, closeBtn);
+    const controls = document.createElement('div');
+    controls.className = 'ltp-head-controls';
+    controls.append(toggleBtn, closeBtn);
+
+    head.append(label, controls);
 
     historyEl = document.createElement('div');
     historyEl.className = 'ltp-history';
@@ -184,7 +229,9 @@
 
     box.append(head, historyEl, divider, transcriptBlock);
     shadow.appendChild(box);
-    document.documentElement.appendChild(host);
+
+    const fullscreenEl = document.fullscreenElement;
+    (fullscreenEl || document.documentElement).appendChild(host);
 
     makeDraggable(head, box);
   }
@@ -244,7 +291,7 @@
 
     handle.addEventListener('pointerdown', (e) => {
       if (e.button !== 0) return;
-      if (e.target.classList?.contains('ltp-close')) return;
+      if (e.target.classList?.contains('ltp-close') || e.target.classList?.contains('ltp-toggle')) return;
 
       const rect = target.getBoundingClientRect();
       dragging = true;
@@ -279,6 +326,14 @@
     handle.addEventListener('pointercancel', stopDragging);
   }
 
+  function resetBoxPosition() {
+    if (!box) return;
+    box.style.removeProperty('left');
+    box.style.removeProperty('top');
+    box.style.removeProperty('bottom');
+    box.style.removeProperty('transform');
+  }
+
   function show() {
     ensureOverlay();
     if (manuallyHidden) return;
@@ -289,7 +344,65 @@
     if (box) box.classList.add('hidden');
   }
 
+  document.addEventListener('fullscreenchange', () => {
+    if (!host) return;
+
+    const fullscreenEl = document.fullscreenElement;
+
+    if (fullscreenEl) {
+      fullscreenEl.appendChild(host);
+    } else {
+      document.documentElement.appendChild(host);
+    }
+
+    resetBoxPosition();
+  });
+
+  function toggleCapture() {
+    if (isCapturing) {
+      chrome.runtime.sendMessage({ type: 'stop-capture' });
+      return;
+    }
+
+    chrome.storage.local.get(
+      ['deepgramKey', 'dashscopeKey', 'deeplKey', 'translationProvider', 'sourceLanguage', 'targetLanguage'],
+      (data) => {
+        if (!data.deepgramKey?.trim()) {
+          liveTranscriptEl.textContent = 'Error: Please set Deepgram API key in extension popup.';
+          liveTranscriptEl.classList.remove('interim');
+          return;
+        }
+
+        chrome.runtime.sendMessage({
+          type: 'start-capture',
+          config: {
+            deepgramKey: data.deepgramKey.trim(),
+            dashscopeKey: (data.dashscopeKey || '').trim(),
+            deeplKey: (data.deeplKey || '').trim(),
+            translationProvider: data.translationProvider || 'qwen-mt-plus',
+            sourceLanguage: data.sourceLanguage || 'multi',
+            targetLanguage: data.targetLanguage || 'ZH'
+          }
+        });
+      }
+    );
+  }
+
+  function updateCaptureButton(capturing) {
+    isCapturing = capturing;
+    if (!toggleBtn) return;
+    toggleBtn.textContent = capturing ? '■' : '▶';
+    toggleBtn.classList.toggle('capturing', capturing);
+  }
+
   chrome.runtime.onMessage.addListener((msg) => {
+    if (msg.type === 'show-overlay') {
+      manuallyHidden = false;
+      ensureOverlay();
+      show();
+      return;
+    }
+
     if (msg.type === 'transcript-result') {
       if (msg.translation && msg.originalText) {
         show();
@@ -308,20 +421,20 @@
 
     if (msg.type === 'capture-status') {
       if (msg.status === 'stopped') {
-        manuallyHidden = false;
+        updateCaptureButton(false);
         resetOverlayContent();
-        hide();
         return;
       }
 
       if (msg.status === 'error' && msg.fatal !== false) {
-        manuallyHidden = false;
+        updateCaptureButton(false);
         resetOverlayContent();
-        hide();
         return;
       }
 
       if (msg.status === 'capturing') {
+        updateCaptureButton(true);
+
         if (msg.resetSession) {
           manuallyHidden = false;
         }

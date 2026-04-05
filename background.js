@@ -63,6 +63,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'get-status':
       sendResponse({ capturing: activeTabId !== null, tabId: activeTabId });
       break;
+
+    case 'show-overlay':
+      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+        if (tabs[0]?.id) {
+          chrome.tabs.sendMessage(tabs[0].id, { type: 'show-overlay' }).catch(() => {});
+        }
+      });
+      break;
   }
 
   return true;
